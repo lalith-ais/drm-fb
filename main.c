@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <signal.h>
 
 #include "util.h"
 
@@ -42,6 +43,15 @@ struct connector {
 
 	struct connector *next;
 };
+
+// Global variable to track if we should exit
+static volatile sig_atomic_t keep_running = 1;
+
+// Signal handler for clean shutdown
+void signal_handler(int sig)
+{
+	keep_running = 0;
+}
 
 static uint32_t find_crtc(int drm_fd, drmModeRes *res, drmModeConnector *conn,
 		uint32_t *taken_crtcs)
@@ -99,7 +109,7 @@ bool create_fb(int drm_fd, uint32_t width, uint32_t height, struct dumb_framebuf
 	uint32_t offsets[4] = { 0 };
 
 	ret = drmModeAddFB2(drm_fd, width, height, DRM_FORMAT_XRGB8888,
-		handles, strides, offsets, &fb->id, 0);
+			handles, strides, offsets, &fb->id, 0);
 	if (ret < 0) {
 		perror("drmModeAddFB2");
 		goto error_dumb;
@@ -113,7 +123,7 @@ bool create_fb(int drm_fd, uint32_t width, uint32_t height, struct dumb_framebuf
 	}
 
 	fb->data = mmap(0, fb->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-		drm_fd, map.offset);
+			drm_fd, map.offset);
 	if (!fb->data) {
 		perror("mmap");
 		goto error_fb;
@@ -132,33 +142,78 @@ error_dumb:
 	return false;
 }
 
-bool load_splash_image(const char *filename, struct dumb_framebuffer *fb)
+bool load_splash_image_from_stdin(struct dumb_framebuffer *fb)
 {
-    int fd = open(filename, O_RDONLY);
-    if (fd < 0) {
-        perror("open splash image");
-        return false;
-    }
+	printf("Reading splash image from stdin...\n");
+	fflush(stdout);
 
-    // Read the raw image data
-    ssize_t bytes_read = read(fd, fb->data, fb->size);
-    if (bytes_read < 0) {
-        perror("read splash image");
-        close(fd);
-        return false;
-    }
+	// Read the raw image data from stdin
+	ssize_t total_read = 0;
+	uint8_t *ptr = fb->data;
+	size_t remaining = fb->size;
 
-    if (bytes_read != fb->size) {
-        fprintf(stderr, "Warning: Splash image size (%zd bytes) doesn't match framebuffer size (%"PRIu64" bytes)\n", 
-                bytes_read, fb->size);
-    }
+	while (remaining > 0) {
+		ssize_t bytes_read = read(STDIN_FILENO, ptr, remaining);
+		if (bytes_read < 0) {
+			perror("read from stdin");
+			return false;
+		}
+		if (bytes_read == 0) {
+			// EOF reached
+			break;
+		}
 
-    close(fd);
-    return true;
+		total_read += bytes_read;
+		ptr += bytes_read;
+		remaining -= bytes_read;
+	}
+
+	printf("Successfully read %zd bytes from stdin (expected %"PRIu64")\n", total_read, fb->size);
+	fflush(stdout);
+
+	if (total_read != fb->size) {
+		fprintf(stderr, "Warning: Input image size (%zd bytes) doesn't match framebuffer size (%"PRIu64" bytes)\n", 
+				total_read, fb->size);
+	}
+
+	return true;
+}
+
+void daemonize()
+{
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		perror("fork");
+		exit(1);
+	}
+
+	if (pid > 0) {
+		// Parent process exits
+		exit(0);
+	}
+
+	// Child process continues
+	setsid(); // Create new session
+
+	// Close standard file descriptors
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
+	close(STDERR_FILENO);
+
+	// Redirect standard file descriptors to /dev/null
+	open("/dev/null", O_RDONLY); // stdin
+	open("/dev/null", O_WRONLY); // stdout
+	open("/dev/null", O_WRONLY); // stderr
 }
 
 int main(void)
 {
+	// Set up signal handlers
+	signal(SIGTERM, signal_handler);
+	signal(SIGINT, signal_handler);
+	signal(SIGHUP, signal_handler);
+
 	/* We just take the first GPU that exists. */
 	int drm_fd = open("/dev/dri/card0", O_RDWR | O_NONBLOCK);
 	if (drm_fd < 0) {
@@ -190,22 +245,25 @@ int main(void)
 
 		conn->id = drm_conn->connector_id;
 		snprintf(conn->name, sizeof conn->name, "%s-%"PRIu32,
-			conn_str(drm_conn->connector_type),
-			drm_conn->connector_type_id);
+				conn_str(drm_conn->connector_type),
+				drm_conn->connector_type_id);
 		conn->connected = drm_conn->connection == DRM_MODE_CONNECTED;
 
 		conn->next = conn_list;
 		conn_list = conn;
 
 		printf("Found display %s\n", conn->name);
+		fflush(stdout);
 
 		if (!conn->connected) {
 			printf("  Disconnected\n");
+			fflush(stdout);
 			goto cleanup;
 		}
 
 		if (drm_conn->count_modes == 0) {
 			printf("No valid modes\n");
+			fflush(stdout);
 			conn->connected = false;
 			goto cleanup;
 		}
@@ -218,6 +276,7 @@ int main(void)
 		}
 
 		printf("  Using CRTC %"PRIu32"\n", conn->crtc_id);
+		fflush(stdout);
 
 		// [0] is the best mode, so we'll just use that.
 		conn->mode = drm_conn->modes[0];
@@ -227,30 +286,31 @@ int main(void)
 		conn->rate = refresh_rate(&conn->mode);
 
 		printf("  Using mode %"PRIu32"x%"PRIu32"@%"PRIu32"\n",
-			conn->width, conn->height, conn->rate);
+				conn->width, conn->height, conn->rate);
+		fflush(stdout);
 
 		if (!create_fb(drm_fd, conn->width, conn->height, &conn->fb)) {
 			conn->connected = false;
 			goto cleanup;
 		}
 
-		printf("  Created framebuffer with ID %"PRIu32"\n", conn->fb.id);
+		printf("  Created framebuffer with ID %"PRIu32" (size: %"PRIu64" bytes)\n", 
+				conn->fb.id, conn->fb.size);
+		fflush(stdout);
 
-		// Load splash image into framebuffer
-		if (!load_splash_image("/root/splash.raw", &conn->fb)) {
+		// Load splash image from stdin into framebuffer
+		if (!load_splash_image_from_stdin(&conn->fb)) {
 			fprintf(stderr, "Failed to load splash image for %s\n", conn->name);
 			conn->connected = false;
 			goto cleanup;
 		}
-
-		printf("  Loaded splash image successfully\n");
 
 		// Save the previous CRTC configuration
 		conn->saved = drmModeGetCrtc(drm_fd, conn->crtc_id);
 
 		// Perform the modeset
 		int ret = drmModeSetCrtc(drm_fd, conn->crtc_id, conn->fb.id, 0, 0,
-			&conn->id, 1, &conn->mode);
+				&conn->id, 1, &conn->mode);
 		if (ret < 0) {
 			perror("drmModeSetCrtc");
 		}
@@ -261,9 +321,15 @@ cleanup:
 
 	drmModeFreeResources(res);
 
-	// Display the splash image for 5 seconds
-	printf("Displaying splash image for 5 seconds...\n");
-	sleep(10);
+	// Now daemonize after we've read from stdin
+	printf("Daemonizing...\n");
+	fflush(stdout);
+	daemonize();
+
+	// Keep running until we receive a signal
+	while (keep_running) {
+		sleep(1);
+	}
 
 	// Cleanup
 	struct connector *conn = conn_list;
@@ -279,7 +345,7 @@ cleanup:
 			drmModeCrtc *crtc = conn->saved;
 			if (crtc) {
 				drmModeSetCrtc(drm_fd, crtc->crtc_id, crtc->buffer_id,
-					crtc->x, crtc->y, &conn->id, 1, &crtc->mode);
+						crtc->x, crtc->y, &conn->id, 1, &crtc->mode);
 				drmModeFreeCrtc(crtc);
 			}
 		}
