@@ -1,0 +1,2 @@
+compile with 
+gcc main.c util.c $(pkg-config --cflags --libs libdrm)
